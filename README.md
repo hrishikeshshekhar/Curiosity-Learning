@@ -1,5 +1,22 @@
 # Curiosity driven reinforcement learning agents in procedurally generated environments
 
+## Setup Instructions
+
+```
+git clone https://github.com/hrishikeshshekhar/curiosity-learning/
+
+```
+
+## How to contribute code
+
+- Fork this repository throught Github. 
+- Make changes to the required modules
+- Lint the code using pylint
+- Create a pull request with specified changes
+- Make the requested changes to the code
+- Merge the PR :)
+
+
 ## Motivation
 
 Generalization remains as one of the most fundamental challenges in deep reinforcement learning. Recent evidence points to the fact that reinforcement learning agents are able to overfit large training datasets. They allow reinforcement learning agents to memorize an optimal policy for the given environment as they always encounter near identical states. However, these methods do not ensure that the agent learns generalizable policies. For example, an agent trained on Mario Level 1 might be able to complete level 1 in super human times. However, it might miserably fail on level 2 since it hasn't been trained on level 2 at all. This shows that the policy learnt by the agent is simply through memorization of the optimal action given a state without any generalizable learning. Hence, the main motivation of this project is to be able to build more generalizable reinforcement learning agents.   
