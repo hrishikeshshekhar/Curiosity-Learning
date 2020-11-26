@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import os
 
 class PPO:
-    def __init__(self, env, critic_layers=[24, 24, 24], actor_layers = [24, 24, 24], verbose=False, max_episode_length=1000, timesteps_per_batch=2000, seed=0, clip=0.1, gamma=0.99, updates_per_rollout = 5, actor_learning_rate=1e-3, critic_learning_rate=1e-3):
+    def __init__(self, env, critic_layers=[24, 24, 24], actor_layers = [24, 24, 24], verbose=False, max_episode_length=1000, timesteps_per_batch=2000, seed=0, clip=0.1, gamma=0.99, updates_per_rollout = 5, actor_learning_rate=1e-3, critic_learning_rate=1e-3, entropy_coeff=1e-4):
         # Assigning hyper parameters
         self.timesteps_per_batch = timesteps_per_batch
         self.max_timesteps_per_episode = max_episode_length
@@ -17,6 +17,7 @@ class PPO:
         self.critic_learning_rate = critic_learning_rate
         self.critic_layers = critic_layers
         self.actor_layers = actor_layers
+        self.entropy_coeff = entropy_coeff
         self.verbose = verbose
 
         # Setting that seed for the model to produce reproducible results
@@ -109,7 +110,7 @@ class PPO:
 
             for timestep in range(self.max_timesteps_per_episode):
                 # Choose the action with the highest probability rather than sampling the action
-                action, _ = self.get_action(state, deterministic=True)
+                action, _, _ = self.get_action(state, deterministic=True)
                 state, reward, done, _ = self.env.step(action)
                 episode_reward.append(reward)
                 if display:
@@ -126,16 +127,25 @@ class PPO:
         plt.ylabel("Total episode reward")
         plt.show()
 
-    def learn(self, timesteps, plot=False):
+    def get_entropy_loss(self, batch_states):
+        # Getting all output probabilities
+        output_probs = self.actor.forward(batch_states)
+
+        # Getting log probs
+        log_probs = torch.log(output_probs)
+
+        # Entropy
+        entropy = self.entropy_coeff * torch.sum(output_probs * log_probs, dim=1).mean()
+        
+        return entropy
+
+    def learn(self, rollouts = 10, plot=False):
         timestep = 0
 
         # Storing the average rollout reward to track training progress
         average_rollout_rewards = []
-        rollout_no = 0
-
-        while timestep <= timesteps:
-            rollout_no += 1
-
+        
+        for rollout_no in range(rollouts):
             # Performing one rollout and getting rollout states, actions and rewards
             batch_states, batch_actions, batch_log_probs, batch_rewards, average_rollout_reward = self.rollout()
             average_rollout_rewards.append(average_rollout_reward)
@@ -160,7 +170,7 @@ class PPO:
                 surr2 = torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * A_k
 
                 # Calculating the losses for the actor and critic
-                actor_loss  = -1 * (torch.min(surr1, surr2)).mean()
+                actor_loss  = -1 * (torch.min(surr1, surr2)).mean() 
                 critic_loss = torch.nn.MSELoss()(V, batch_rewards)
 
                 # Updating the actor network
@@ -175,6 +185,9 @@ class PPO:
 
             timestep += len(batch_states)
 
+        # Converting average rollout rewards into a numpy array
+        average_rollout_rewards = np.array(average_rollout_rewards)
+        
         if(plot):
             plt.plot(average_rollout_rewards)
             plt.title("Average rollout reward vs rollout number")
@@ -184,7 +197,51 @@ class PPO:
 
         return average_rollout_rewards
 
-    def evaluate(self, no_seeds=5, learning_steps=1e5):
+    def investigate_entropy(self, total_seeds = 3, rollouts=10, entropy_coefficients=[1e-1, 1e-2, 1e-3, 1e-4, 0]):
+        # Saving the initial value of the entropy coeff 
+        initial_entropy = self.entropy_coeff
+
+        # Creating a set of seeds
+        seeds = [random.randint(0, 1e6) for _ in range(total_seeds)]
+
+        # Iterating over differnt entropy coefficient values
+        for entropy_coeff in entropy_coefficients:
+            # Storing the rewards for each entropy coeff
+            entropy_rewards = []
+
+            # Iterating over many random seeds for each entropy
+            for seed in seeds:
+                # Setting the seed
+                self.set_seed(seed)
+
+                # Setting the entropy coeff
+                self.entropy_coeff = entropy_coeff
+
+                # Reinitializing the models
+                self.initialize_models()
+
+                # Training the model
+                rewards = self.learn(rollouts=rollouts)
+
+                # Saving the entropy rewards
+                entropy_rewards.append(rewards)
+
+            # Taking an average across all the seeds
+            all_rewards = np.array(entropy_rewards)
+            average_rewards = np.mean(all_rewards, axis=0)
+
+            # Plotting the average rewards
+            plt.plot(average_rewards, label="E = " + str(entropy_coeff))
+            print("Completed training for entropy coefficient : {}".format(entropy_coeff))
+                        
+        # Plotting the whole graph
+        plt.legend()
+        plt.show()
+
+        # Resetting the entropy coefficient
+        self.entropy_coeff = initial_entropy
+
+    def evaluate(self, no_seeds=5, rollouts=50):
         # Iterate over random seeds and record performance
         for seed_no in range(no_seeds):
             seed = random.randint(0, 1e5)
@@ -196,7 +253,7 @@ class PPO:
             self.initialize_models()
 
             # Training the model
-            agent_rewards = self.learn(learning_steps)
+            agent_rewards = self.learn(rollouts=rollouts)
             plt.plot(agent_rewards, label="Seed no : {}".format(seed))
 
         # Plotting rewards vs rollout number
@@ -209,7 +266,9 @@ class PPO:
     def get_action(self, state, deterministic=False):
         # Getting the action output probabilities
         action_output_probs = self.actor.forward(state).detach().numpy()
-
+        action_output_log_probs = np.log(action_output_probs)
+        entropy = -1 * np.sum(action_output_probs * action_output_log_probs)
+        
         # Selecting the most probable action
         if deterministic:
             action = np.argmax(action_output_probs)
@@ -221,31 +280,45 @@ class PPO:
         probability = action_output_probs[action]
         log_prob = np.log(probability)
 
-        return action, log_prob
+        return action, log_prob, entropy
 
-    def calculate_rewards(self, batch_rewards):
+    def calculate_rewards(self, batch_rewards, batch_entropies):
         # Calculating rewards per episode
         gamma_discounted_rewards = []
+        total_episodes = len(batch_rewards)
 
-        for episode_rewards in batch_rewards:
+        # Finding the total number of episodes
+        for episode_num in range(total_episodes):
+            episode_rewards = batch_rewards[episode_num]
+            episode_entropies = batch_entropies[episode_num]
+
+            episode_entropy = 0
             episode_reward = 0
             episode_length = len(episode_rewards)
             episode_gamma_rewards = []
+            episode_gamma_entropies = []
 
             # Reversing the rewards and multiplying by gamma at each stage to get gamma discounted rewards
             for timestep in reversed(range(episode_length)):
                 episode_reward *= self.gamma
+                episode_entropy *= self.gamma
                 episode_reward += episode_rewards[timestep]
+                episode_entropy += episode_entropies[timestep]
                 episode_gamma_rewards.append(episode_reward)
+                episode_gamma_entropies.append(episode_entropy)
 
             # Reversing again to get the rewards in the right order
             episode_gamma_rewards = np.array(episode_gamma_rewards[::-1])
+            episode_gamma_entropies = self.entropy_coeff * np.array(episode_gamma_entropies[::-1])
+            
+            # Modifying the episode rewards by adding the entropies
+            modified_episode_rewards = episode_gamma_rewards + episode_gamma_entropies
 
             # Subtracting mean and dividing by standard deviation to reduce variance and improve stability
-            episode_gamma_rewards = (episode_gamma_rewards - episode_gamma_rewards.mean()) / episode_gamma_rewards.std()
+            modified_episode_rewards = (modified_episode_rewards - modified_episode_rewards.mean()) / (modified_episode_rewards.std() + 1e-8)
 
             # Appending all the rewards to gamma discounted rewards
-            for reward in episode_gamma_rewards:
+            for reward in modified_episode_rewards:
                 gamma_discounted_rewards.append(reward)
 
         # Creating an output tensor from the rewards
@@ -283,8 +356,9 @@ class PPO:
         batch_actions = []
         batch_log_probs = []
         batch_rewards = []
+        batch_entropies = []
         all_episode_rewards = []
-
+        
         # Timestep counter
         t = 0
 
@@ -292,6 +366,7 @@ class PPO:
             # Rewards this episode
             state = self.env.reset()
             episode_rewards = []
+            episode_entropies = []
 
             for episode_steps in range(self.max_timesteps_per_episode):
                 # Incrementing the total timesteps for this batch
@@ -301,7 +376,7 @@ class PPO:
                 batch_states.append(state)
 
                 # Choosing an action using the current actor network
-                action, log_prob = self.get_action(state)
+                action, log_prob, entropy = self.get_action(state)
                 state, reward, done, _ = self.env.step(action)
 
                 # Collecting the reward, action and log_prob
@@ -309,6 +384,9 @@ class PPO:
 
                 # Changing the action from an integer to a one hot vector
                 batch_actions.append(self.onehot(action, self.action_dim))
+                
+                # Storing the entropy
+                episode_entropies.append(entropy)
 
                 # Saving the log probabilities of each action
                 batch_log_probs.append(log_prob)
@@ -319,6 +397,7 @@ class PPO:
             # Collecting the episode rewards and lengths
             batch_rewards.append(episode_rewards)
             all_episode_rewards.append(np.sum(episode_rewards))
+            batch_entropies.append(episode_entropies)
 
         # Convert data into tensors
         batch_states = torch.tensor(batch_states, dtype=torch.float32)
@@ -326,7 +405,7 @@ class PPO:
         batch_log_probs = torch.tensor(batch_log_probs, dtype=torch.float32)
 
         # Calculating the batch rewards
-        batch_rewards = self.calculate_rewards(batch_rewards)
+        batch_rewards = self.calculate_rewards(batch_rewards, batch_entropies)
         average_rollout_reward = np.mean(all_episode_rewards)
 
         return batch_states, batch_actions, batch_log_probs, batch_rewards, average_rollout_reward
