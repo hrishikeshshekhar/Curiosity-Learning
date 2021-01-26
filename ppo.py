@@ -1,412 +1,324 @@
-from network import NeuralNetwork
-import random
-import numpy as np
+from assets.utils_misc import adjust_lr, get_n_params
+from ICM import *
 import torch
-import matplotlib.pyplot as plt
-import os
+import torch.optim as optim
+from torch import nn
+import numpy as np
 
-class PPO:
-    def __init__(self, env, critic_layers=[24, 24, 24], actor_layers = [24, 24, 24], verbose=False, max_episode_length=1000, timesteps_per_batch=2000, seed=0, clip=0.1, gamma=0.99, updates_per_rollout = 5, actor_learning_rate=1e-3, critic_learning_rate=1e-3, entropy_coeff=1e-4):
-        # Assigning hyper parameters
-        self.timesteps_per_batch = timesteps_per_batch
-        self.max_timesteps_per_episode = max_episode_length
-        self.updates_per_rollout = updates_per_rollout
-        self.gamma = gamma
-        self.clip = clip
-        self.actor_learning_rate = actor_learning_rate
-        self.critic_learning_rate = critic_learning_rate
-        self.critic_layers = critic_layers
-        self.actor_layers = actor_layers
-        self.entropy_coeff = entropy_coeff
-        self.verbose = verbose
 
-        # Setting that seed for the model to produce reproducible results
-        self.set_seed(seed)
+class PPO(object):
+    def __init__(self,env,v_env,policy,logger,storage,device,n_checkpoints,
+                 n_steps=128,n_envs=8,epoch=3,mini_batch_per_epoch=8,mini_batch_size=32 * 8,
+                 gamma=0.99,laambda=0.95,learning_rate=2.5e-4,grad_clip_norm=0.5,
+                 eps_clip=0.2,value_coef=0.5,entropy_coef=0.01,normalize_adv=True,
+                 use_gae=True,**kwargs):
 
-        # Environment variables
         self.env = env
-        self.state_dim = self.env.observation_space.shape[0]
-        self.action_dim = self.env.action_space.n
-
-        # Initializing actor and critic models
-        self.initialize_models()
-
-    def initialize_models(self):
-        # Creating the actor and critic networks
-        actor_layers = [self.state_dim, *self.actor_layers, self.action_dim]
-        critic_layers = [self.state_dim, *self.critic_layers, 1]
-        self.actor = NeuralNetwork(actor_layers)
-        self.critic = NeuralNetwork(critic_layers, softmax=False)
-
-        # Creating the optimizers for the actor and critic networks
-        self.actor_optim  = torch.optim.Adam(self.actor.parameters(),  lr=self.actor_learning_rate)
-        self.critic_optim = torch.optim.Adam(self.critic.parameters(), lr=self.critic_learning_rate)
-
-    def set_seed(self, seed):
-        # Setting seeds for numpy and torch
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-
-    def save(self, model_name = None):
-        # Getting the env name if no model_name is given
-        if not model_name:
-            model_name = self.env.unwrapped.spec.id
-
-        # Checking for the weights folder and navigating to the weights folder
-        if(not os.path.exists("./weights")):
-            os.mkdir("./weights")
-        os.chdir("./weights")
-
-        # Checking for the model name folder and navigating to that folder
-        if(not os.path.exists("./" + model_name)):
-            os.mkdir("./" + model_name)
-        os.chdir("./" + model_name)
-
-        # Saving the actor and the critic weights
-        torch.save(self.actor.state_dict(), "./actor_weights")
-        torch.save(self.critic.state_dict(), "./critic_weights")
-        print("Successfully saved weights for the environment : {}".format(model_name))
-
-        # Changing back to the root directory
-        os.chdir("./../../")
-
-    def load(self, model_name = None):
-        # Getting the env name if no model_name is given
-        if not model_name:
-            model_name = self.env.unwrapped.spec.id
-
-        # Checking for the weights folder and navigating to the weights folder
-        if(not os.path.exists("./weights")):
-            print("No weights folder exists")
-            return
-        os.chdir("./weights")
-
-        # Checking for the model name folder and navigating to that folder
-        if(not os.path.exists("./" + model_name)):
-            print("No saved weights exists for the env : {}".format(model_name))
-            return
-        os.chdir("./" + model_name)
-
-        # Loading the actor and critic models
-        try:
-            self.actor.load_state_dict(torch.load("./actor_weights"))
-            self.critic.load_state_dict(torch.load("./critic_weights"))
-        except:
-            print("Error loading weights of actor or critic network for the environment : {} ".format(model_name))
-
-        # Changing back to the root directory
-        os.chdir("./../../")
-
-        print("Successfully loaded weights : {}".format(model_name))
-
-    def test(self, episodes=10, display=False):
-        # Storing rewards from each episode
-        rewards = []
-        model_name = self.env.unwrapped.spec.id
-
-        for episode in range(episodes):
-            state = self.env.reset()
-            episode_reward = []
-
-            for timestep in range(self.max_timesteps_per_episode):
-                # Choose the action with the highest probability rather than sampling the action
-                action, _, _ = self.get_action(state, deterministic=True)
-                state, reward, done, _ = self.env.step(action)
-                episode_reward.append(reward)
-                if display:
-                    self.env.render()
-                if done:
-                    break
-
-            rewards.append(np.sum(episode_reward))
-
-        print("Average reward : {}".format(np.mean(rewards)))
-        plt.plot(rewards)
-        plt.title("PPO Performance on environment : {}".format(model_name))
-        plt.xlabel("Episode Number")
-        plt.ylabel("Total episode reward")
-        plt.show()
-
-    def get_entropy_loss(self, batch_states):
-        # Getting all output probabilities
-        output_probs = self.actor.forward(batch_states)
-
-        # Getting log probs
-        log_probs = torch.log(output_probs)
-
-        # Entropy
-        entropy = self.entropy_coeff * torch.sum(output_probs * log_probs, dim=1).mean()
+        self.v_env = v_env
+        self.policy = policy
         
-        return entropy
+        self.hyp_params = {
+                'batch_size':150,
+                'beta':0.2,
+                'eta': 10.0,
+                'gamma':0.2,
+                'max_episode_len':100,
+                'min_progress':15,
+                'action_repeats':6,
+                'frames_per_state':3
+                }
 
-    def learn(self, rollouts = 10, plot=False):
-        timestep = 0
 
-        # Storing the average rollout reward to track training progress
-        average_rollout_rewards = []
+
+         
+        self.encoder = Phi()
+        self.forward_model = Fnet()
+        self.inverse_model = Gnet()
+        self.forward_loss = nn.MSELoss(reduction='none')
+        self.inverse_loss = nn.CrossEntropyLoss(reduction='none')
+
+        self.all_model_params = list(self.policy.parameters()) + list(self.encoder.parameters())
+        self.all_model_params += list(self.forward_model.parameters()) + list(self.inverse_model.parameters())   #We can add the parameters from each model into a single list and pass that into a single optimizer
+
+        self.learning_rate = learning_rate
+
+        self.optimizer = optim.Adam(params=self.all_model_params, lr=learning_rate, eps=1e-5) 
+
+
+
+
+        self.logger = logger
+        self.storage = storage
+        self.device = device
+        self.num_checkpoints = n_checkpoints
+        self.t = 0
+        self.n_steps = n_steps
+        self.n_envs = n_envs
+        self.epoch = epoch
         
-        for rollout_no in range(rollouts):
-            # Performing one rollout and getting rollout states, actions and rewards
-            batch_states, batch_actions, batch_log_probs, batch_rewards, average_rollout_reward = self.rollout()
-            average_rollout_rewards.append(average_rollout_reward)
-
-            if (self.verbose):
-                print("Average rollout reward for rollout number {} is : {}".format(rollout_no, average_rollout_reward))
-
-            # Calculating the values for each state
-            V, _ = self.get_values(batch_states, batch_actions)
-
-            # Calculating advantages
-            A_k = batch_rewards - V.detach()
-
-            for _ in range(self.updates_per_rollout):
-                # Calculating current log probabilities and values
-                V, curr_log_probs = self.get_values(batch_states, batch_actions)
-
-                ratios = torch.exp(curr_log_probs - batch_log_probs)
-
-                # Calculating the surrogate losses
-                surr1 = ratios * A_k
-                surr2 = torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * A_k
-
-                # Calculating the losses for the actor and critic
-                actor_loss  = -1 * (torch.min(surr1, surr2)).mean() 
-                critic_loss = torch.nn.MSELoss()(V, batch_rewards)
-
-                # Updating the actor network
-                self.actor_optim.zero_grad()
-                actor_loss.backward(retain_graph=True)
-                self.actor_optim.step()
-
-                # Updating the critic network
-                self.critic_optim.zero_grad()
-                critic_loss.backward()
-                self.critic_optim.step()
-
-            timestep += len(batch_states)
-
-        # Converting average rollout rewards into a numpy array
-        average_rollout_rewards = np.array(average_rollout_rewards)
         
-        if(plot):
-            plt.plot(average_rollout_rewards)
-            plt.title("Average rollout reward vs rollout number")
-            plt.xlabel("Rollout Number")
-            plt.ylabel("Average rollout reward")
-            plt.show()
-
-        return average_rollout_rewards
-
-    def investigate_entropy(self, total_seeds = 3, rollouts=10, entropy_coefficients=[1e-1, 1e-2, 1e-3, 1e-4, 0]):
-        # Saving the initial value of the entropy coeff 
-        initial_entropy = self.entropy_coeff
-
-        # Creating a set of seeds
-        seeds = [random.randint(0, 1e6) for _ in range(total_seeds)]
-
-        # Iterating over differnt entropy coefficient values
-        for entropy_coeff in entropy_coefficients:
-            # Storing the rewards for each entropy coeff
-            entropy_rewards = []
-
-            # Iterating over many random seeds for each entropy
-            for seed in seeds:
-                # Setting the seed
-                self.set_seed(seed)
-
-                # Setting the entropy coeff
-                self.entropy_coeff = entropy_coeff
-
-                # Reinitializing the models
-                self.initialize_models()
-
-                # Training the model
-                rewards = self.learn(rollouts=rollouts)
-
-                # Saving the entropy rewards
-                entropy_rewards.append(rewards)
-
-            # Taking an average across all the seeds
-            all_rewards = np.array(entropy_rewards)
-            average_rewards = np.mean(all_rewards, axis=0)
-
-            # Plotting the average rewards
-            plt.plot(average_rewards, label="E = " + str(entropy_coeff))
-            print("Completed training for entropy coefficient : {}".format(entropy_coeff))
-                        
-        # Plotting the whole graph
-        plt.legend()
-        plt.show()
-
-        # Resetting the entropy coefficient
-        self.entropy_coeff = initial_entropy
-
-    def evaluate(self, no_seeds=5, rollouts=50):
-        # Iterate over random seeds and record performance
-        for seed_no in range(no_seeds):
-            seed = random.randint(0, 1e5)
-
-            # Setting the seed
-            self.set_seed(seed)
-
-            # Initializing new parameters for the actor and critic
-            self.initialize_models()
-
-            # Training the model
-            agent_rewards = self.learn(rollouts=rollouts)
-            plt.plot(agent_rewards, label="Seed no : {}".format(seed))
-
-        # Plotting rewards vs rollout number
-        plt.title("Reward vs rollout number")
-        plt.xlabel("Rollout Number")
-        plt.ylabel("Reward")
-        plt.legend()
-        plt.show()
-
-    def get_action(self, state, deterministic=False):
-        # Getting the action output probabilities
-        action_output_probs = self.actor.forward(state).detach().numpy()
-        action_output_log_probs = np.log(action_output_probs)
-        entropy = -1 * np.sum(action_output_probs * action_output_log_probs)
+        self.mini_batch_per_epoch = mini_batch_per_epoch
+        self.mini_batch_size = mini_batch_size
+        self.grad_clip_norm = grad_clip_norm
+        self.eps_clip = eps_clip
+        self.gamma = gamma
+        self.laambda = laambda
+        self.value_coef = value_coef
+        self.entropy_coef = entropy_coef
+        self.normalize_adv = normalize_adv
+        self.use_gae = use_gae    #Generalised Advantage Estimation algorithm to calculate the Advantage
+        self.use_explicit = True
         
-        # Selecting the most probable action
-        if deterministic:
-            action = np.argmax(action_output_probs)
-        else:
-            # Using the action output probabilities to sample an action
-            action = random.choices([i for i in range(self.action_dim)], weights=action_output_probs)[0]
 
-        # Extracting the probability and log probability of the action chosen
-        probability = action_output_probs[action]
-        log_prob = np.log(probability)
+    
+    def loss_fn(self, inverse_loss, forward_loss):
+        loss_ = (1 - self.hyp_params['beta']) * inverse_loss
+        loss_ += self.hyp_params['beta'] * forward_loss
+        loss_ = loss_.sum() / loss_.flatten().shape[0]
+        loss = loss_ 
+        return loss
 
-        return action, log_prob, entropy
 
-    def calculate_rewards(self, batch_rewards, batch_entropies):
-        # Calculating rewards per episode
-        gamma_discounted_rewards = []
-        total_episodes = len(batch_rewards)
 
-        # Finding the total number of episodes
-        for episode_num in range(total_episodes):
-            episode_rewards = batch_rewards[episode_num]
-            episode_entropies = batch_entropies[episode_num]
+    def ICM(self,state1, action, state2, forward_scale=1., inverse_scale=1e4):
+        enc = self.encoder.cuda()
+        state1_hat = enc(state1.cuda())
+        state2_hat = enc(state2.cuda())
 
-            episode_entropy = 0
-            episode_reward = 0
-            episode_length = len(episode_rewards)
-            episode_gamma_rewards = []
-            episode_gamma_entropies = []
+        #action = action.cuda()
 
-            # Reversing the rewards and multiplying by gamma at each stage to get gamma discounted rewards
-            for timestep in reversed(range(episode_length)):
-                episode_reward *= self.gamma
-                episode_entropy *= self.gamma
-                episode_reward += episode_rewards[timestep]
-                episode_entropy += episode_entropies[timestep]
-                episode_gamma_rewards.append(episode_reward)
-                episode_gamma_entropies.append(episode_entropy)
-
-            # Reversing again to get the rewards in the right order
-            episode_gamma_rewards = np.array(episode_gamma_rewards[::-1])
-            episode_gamma_entropies = self.entropy_coeff * np.array(episode_gamma_entropies[::-1])
-            
-            # Modifying the episode rewards by adding the entropies
-            modified_episode_rewards = episode_gamma_rewards + episode_gamma_entropies
-
-            # Subtracting mean and dividing by standard deviation to reduce variance and improve stability
-            modified_episode_rewards = (modified_episode_rewards - modified_episode_rewards.mean()) / (modified_episode_rewards.std() + 1e-8)
-
-            # Appending all the rewards to gamma discounted rewards
-            for reward in modified_episode_rewards:
-                gamma_discounted_rewards.append(reward)
-
-        # Creating an output tensor from the rewards
-        gamma_discounted_tensor = torch.tensor(gamma_discounted_rewards, dtype=torch.float32)
-
-        return gamma_discounted_tensor
-
-    def get_values(self, batch_states, batch_actions):
-        # Calculating the value of each state using the current version of the critic network
-        V = self.critic.forward(batch_states).squeeze()
-
-        # Calculating the probability of each action using the current version of the policy network
-        output_probs = self.actor.forward(batch_states)
-
-        # Batch actions is made into a one hot vector. Hence, only the chosen action's probability will be multiplied by 1 and the other actions will be multiplied by 0
-        probs = output_probs * batch_actions
-
-        # Taking a summation across each timestep, we will get the action probability we need
-        probs = probs.sum(dim=1)
-
-        # Calculating log probabilities
-        log_probs = torch.log(probs)
-
-        return V, log_probs
-
-    def onehot(self, action, size):
-        # Generating a one hot vector of length = size
-        output = np.zeros(size)
-        output[action] = 1
-        return output
-
-    def rollout(self):
-        # Collecting data of the rollout
-        batch_states = []
-        batch_actions = []
-        batch_log_probs = []
-        batch_rewards = []
-        batch_entropies = []
-        all_episode_rewards = []
+        forward_mod =  self.forward_model.cuda()
+        state2_hat_pred = forward_mod(state1_hat.detach(), action.detach())   #Runs the forward model using the encoded states, but we detach them from the graph
+        forward_pred_err = forward_scale * self.forward_loss(state2_hat_pred, \
+                                                        state2_hat.detach()).sum(dim=1).unsqueeze(dim=1)
         
-        # Timestep counter
-        t = 0
+        inv_model = self.inverse_model.cuda()
+        pred_action = inv_model(state1_hat, state2_hat)                     #The inverse model returns a softmax probability distribution over actions.
+        inverse_pred_err = inverse_scale * self.inverse_loss(pred_action, \
+                                                        action.detach().flatten().long()).unsqueeze(dim=1)
+        return forward_pred_err, inverse_pred_err
 
-        while t < self.timesteps_per_batch:
-            # Rewards this episode
-            state = self.env.reset()
-            episode_rewards = []
-            episode_entropies = []
 
-            for episode_steps in range(self.max_timesteps_per_episode):
-                # Incrementing the total timesteps for this batch
-                t += 1
 
-                # Collecting the observations
-                batch_states.append(state)
 
-                # Choosing an action using the current actor network
-                action, log_prob, entropy = self.get_action(state)
-                state, reward, done, _ = self.env.step(action)
+    def predict(self, obs, hidden_state, done):
+        """
+        Action predicted by the actor network which will be took based on his policy.
+        :param obs: environment observation as an array
+        :param hidden_state: Information flow for the GRU layer
+        :param done: array informing of the state of an agent in an environment
+        :return: sampled action from the policy; log_prob from this policy; value estimate; hidden_states
+        """
+        with torch.no_grad():
+            obs = torch.FloatTensor(obs).to(device=self.device)
+            hidden_state = torch.FloatTensor(hidden_state).to(device=self.device)
+            mask = torch.FloatTensor(1 - done).to(device=self.device)
+            dist, value, hidden_state = self.policy(obs, hidden_state, mask)
+            act = dist.sample()
+            log_prob_act = dist.log_prob(act)
 
-                # Collecting the reward, action and log_prob
-                episode_rewards.append(reward)
 
-                # Changing the action from an integer to a one hot vector
-                batch_actions.append(self.onehot(action, self.action_dim))
+        #predicted action 'a't for forward model
+        return act.cpu().numpy(), log_prob_act.cpu().numpy(), value.cpu().numpy(), hidden_state.cpu().numpy() 
+
+    def action(self, obs):
+        """
+        Only for evaluation
+        :param obs: Only requires observation from the environment to make predictions since no backward pass is done.
+        :return: action sampled; log_prob distribution; value estimate; hidden_state (which can be ignored).
+        """
+        hidden_state = np.zeros((self.n_envs, self.storage.hidden_state_size))
+        done = np.zeros(self.n_envs)
+        self.policy.eval()
+        with torch.no_grad():
+            obs = torch.FloatTensor(obs).to(device=self.device)
+            hidden_state = torch.FloatTensor(hidden_state).to(device=self.device)
+            mask = torch.FloatTensor(1 - done).to(device=self.device)
+            dist, value, hidden_state = self.policy(obs, hidden_state, mask)
+            act = dist.sample()
+            log_prob_act = dist.log_prob(act)
+
+        return act.cpu().numpy(), log_prob_act.cpu().numpy(), value.cpu().numpy(), hidden_state.cpu()
+
+    def optimize(self):
+        """
+        Applying batch generation from IMPALA.
+        :return: Summary of the surrogate objective loss
+        """
+        pi_loss_list, value_loss_list, entropy_loss_list = [], [], []
+        batch_size = self.n_steps * self.n_envs // self.mini_batch_per_epoch
+        if batch_size < self.mini_batch_size:
+            self.mini_batch_size = batch_size
+        grad_accumulation_steps = batch_size / self.mini_batch_size
+        grad_accumulation_cnt = 1
+
+        self.policy.train()
+        for e in range(self.epoch):
+            recurrent = self.policy.is_recurrent()
+            generator = self.storage.fetch_train_generator(mini_batch_size=self.mini_batch_size,
+                                                           recurrent=recurrent)
+            for sample in generator:
+                obs_batch, hidden_state_batch, act_batch, done_batch, \
+                old_log_prob_act_batch, old_value_batch, return_batch, adv_batch, _ = sample
                 
-                # Storing the entropy
-                episode_entropies.append(entropy)
 
-                # Saving the log probabilities of each action
-                batch_log_probs.append(log_prob)
+                mask_batch = (1 - done_batch)
+                dist_batch, value_batch, _ = self.policy(obs_batch, hidden_state_batch, mask_batch)
 
-                if done:
-                    break
 
-            # Collecting the episode rewards and lengths
-            batch_rewards.append(episode_rewards)
-            all_episode_rewards.append(np.sum(episode_rewards))
-            batch_entropies.append(episode_entropies)
+                #Calculating Curiosity
+                state1_batch = obs_batch[0:2047]
+                state2_batch = obs_batch[1:2048]
+                action_batch = torch.unsqueeze(act_batch[0:2047],1)
+                forward_pred_err, inverse_pred_err = self.ICM(state1_batch, action_batch, state2_batch)
+                i_reward = (1. / self.hyp_params['eta']) * forward_pred_err     #Scales the forward prediction error using the eta parameter
+                reward_int = i_reward.detach()  
+                loss_intrinsic_mod = self.loss_fn(inverse_loss = inverse_pred_err, forward_loss =forward_pred_err)
 
-        # Convert data into tensors
-        batch_states = torch.tensor(batch_states, dtype=torch.float32)
-        batch_actions = torch.tensor(batch_actions, dtype=torch.long)
-        batch_log_probs = torch.tensor(batch_log_probs, dtype=torch.float32)
+                if self.use_explicit:
+                    #print(f"Adding intrinsic reward: {self.use_explicit}")
+                    return_batch[:2047] += torch.squeeze(reward_int)
 
-        # Calculating the batch rewards
-        batch_rewards = self.calculate_rewards(batch_rewards, batch_entropies)
-        average_rollout_reward = np.mean(all_episode_rewards)
 
-        return batch_states, batch_actions, batch_log_probs, batch_rewards, average_rollout_reward
+                # Clipped Surrogate Objective
+                log_prob_act_batch = dist_batch.log_prob(act_batch)
+                ratio = torch.exp(log_prob_act_batch - old_log_prob_act_batch)
+                surr1 = ratio * adv_batch
+                surr2 = torch.clamp(ratio, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * adv_batch
+                pi_loss = -torch.min(surr1, surr2).mean()
 
+                # Clipped Bellman-Error
+                clipped_value_batch = old_value_batch + (value_batch - old_value_batch).clamp(-self.eps_clip,
+                                                                                              self.eps_clip)
+                v_surr1 = (value_batch - return_batch).pow(2)
+                v_surr2 = (clipped_value_batch - return_batch).pow(2)
+                value_loss = 0.5 * torch.max(v_surr1, v_surr2).mean()
+
+                # Policy's Entropy
+                entropy_loss = dist_batch.entropy().mean()
+                loss = pi_loss + self.value_coef * value_loss - self.entropy_coef * entropy_loss + loss_intrinsic_mod #####LOSS##################
+                loss.backward()
+
+                # Lets the model to handle large batch_size with small gpu_memory
+                if grad_accumulation_cnt % grad_accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.grad_clip_norm)
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                grad_accumulation_cnt += 1
+                pi_loss_list.append(pi_loss.item())
+                value_loss_list.append(value_loss.item())
+                entropy_loss_list.append(entropy_loss.item())
+
+        summary = {'Loss/pi': np.mean(pi_loss_list),
+                   'Loss/v': np.mean(value_loss_list),
+                   'Loss/entropy': np.mean(entropy_loss_list)}
+        return summary
+
+    def eval(self):
+        """
+        Only collects relevant information to evaluate the reward of the agent in an evaluation environment (similar to 'train')
+        :return: Summary of reward for the Logger
+        """
+        info_batch = []
+        episode_rewards = []
+        eval_reward = torch.zeros(self.n_steps, self.n_envs)
+        ep_done = torch.zeros(self.n_steps, self.n_envs)
+        episode_reward_buffer = []
+        eval_obs = self.v_env.reset()
+        for _ in range(self.n_envs):
+            episode_rewards.append([])
+        self.policy.eval()
+        for step in range(self.n_steps):
+            eval_act, _, _, eval_next_hidden_state = self.action(eval_obs)
+            eval_next_obs, eval_rew, eval_done, info = self.env.step(eval_act)    
+            ep_done[step] = torch.from_numpy(eval_done.copy())
+            eval_reward[step] = torch.from_numpy(eval_rew.copy())
+            info_batch.append(info)
+            eval_obs = eval_next_obs
+
+        if 'env_reward' in info_batch[0][0]:
+            rew_batch = []
+            for step in range(self.n_steps):
+                infos = info_batch[step]
+                rew_batch.append([info['env_reward'] for info in infos])
+            rew_batch = np.array(rew_batch)
+        else:
+            rew_batch = eval_reward.numpy()
+        if 'env_done' in info_batch[0][0]:
+            done_batch = []
+            for step in range(self.n_steps):
+                infos = info_batch[step]
+                done_batch.append([info['env_done'] for info in infos])
+            done_batch = np.array(done_batch)
+        else:
+            done_batch = ep_done.numpy()
+
+        steps = rew_batch.shape[0]
+        rew_batch = rew_batch.T
+        done_batch = done_batch.T
+        for i in range(self.n_envs):
+            for j in range(steps):
+                episode_rewards[i].append(rew_batch[i][j])
+                if done_batch[i][j]:
+                    episode_reward_buffer.append(np.sum(episode_rewards[i]))
+                    episode_rewards[i] = []
+        return episode_reward_buffer, np.max(episode_reward_buffer)
+
+    def train(self, num_timesteps):
+        """
+        It trains agent through running the policy, computing advantage estimates from the value function,
+        optimize the policy and value network, logging the training procedure and finally evaluating the model.
+        :param num_timesteps: Number of timesteps for running the training
+        """
+        save_every = num_timesteps // self.num_checkpoints
+        checkpoint_cnt = 0
+        obs = self.env.reset()
+        hidden_state = np.zeros((self.n_envs, self.storage.hidden_state_size))
+        done = np.zeros(self.n_envs)
+
+        recurrent = self.policy.is_recurrent()
+        generator = self.storage.fetch_train_generator(mini_batch_size=self.mini_batch_size,
+                                                           recurrent=recurrent)
+
+        while self.t < num_timesteps:
+            # Runs the Policy
+            self.policy.eval()
+            for _ in range(self.n_steps):
+                act, log_prob_act, value, next_hidden_state = self.predict(obs, hidden_state, done)
+                next_obs, rew, done, info = self.env.step(act)    #New state(eval_next_obs) and current state(eval_obs)
+                
+                ######print("hyyy", np.shape(torch.squeeze(torch.from_numpy(next_obs))),np.shape(torch.squeeze(torch.from_numpy(obs))))#####
+                
+                self.storage.store(obs, hidden_state, act, rew, done, info, log_prob_act, value)
+                obs = next_obs
+                hidden_state = next_hidden_state
+            
+            
+                
+            _, _, last_val, hidden_state = self.predict(obs, hidden_state, done)
+            self.storage.store_last(obs, hidden_state, last_val)
+
+
+            # Computing the advantage estimates
+            self.storage.compute_estimates(self.gamma, self.laambda, self.use_gae, self.normalize_adv)
+
+
+            # Optimizing policy and value
+            summary = self.optimize()
+
+            # Log into the training procedure
+            self.t += self.n_steps * self.n_envs
+            rew_batch, done_batch = self.storage.fetch_log_data()
+            # Evaluating 
+            eval_batch, eval_max = self.eval()
+            self.logger.feed(rew_batch, done_batch, eval_batch, eval_max)
+            self.logger.write_summary(summary)
+            self.logger.dump()
+            self.optimizer = adjust_lr(self.optimizer, self.learning_rate, self.t, num_timesteps)
+            ####################### Saving the model#############################
+            if self.t > ((checkpoint_cnt + 1) * save_every):
+                torch.save({'state_dict': self.policy.state_dict()}, self.logger.logdir +
+                           '/model_' + str(self.t) + '.pth')
+                checkpoint_cnt += 1
+        self.env.close()
+    
