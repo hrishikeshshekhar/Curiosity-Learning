@@ -1,4 +1,4 @@
-from assets.utils_misc import orthogonal_init
+from .utils_misc import orthogonal_init
 import torch.nn as nn
 import torch
 
